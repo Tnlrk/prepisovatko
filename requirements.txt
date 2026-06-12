@@ -1,0 +1,7 @@
+# Python balíčky pro Přepisovátko (cílí na Python 3.14, fungují i na 3.12)
+sherpa-onnx
+numpy
+customtkinter
+tkinterdnd2
+psutil
+pillow

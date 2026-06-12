@@ -1,0 +1,30 @@
+# --- Velké binární součásti (NEpatří do gitu, viz BUILD.md / Releases) ---
+prepisovatko/.venv/
+prepisovatko/bin/
+prepisovatko/models/
+prepisovatko/python/
+prepisovatko/test/
+dist/
+*.zip
+
+# --- Testovací média ---
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.mkv
+*.mov
+
+# --- Interní vývojový dokument (necommitovat) ---
+PREPISOVATKO_PROJEKT.md
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# --- OS ---
+Thumbs.db
+desktop.ini
+.DS_Store

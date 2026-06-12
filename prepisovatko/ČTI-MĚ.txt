@@ -1,0 +1,30 @@
+PŘEPISOVÁTKO v1.1.2
+====================
+Lokální (offline) přepis nahrávek z porad s detekcí mluvčích.
+Nic se neposílá na internet — vše běží na tomto počítači.
+
+SPUŠTĚNÍ
+--------
+1. Rozbal celou složku „Prepisovatko" kamkoli (např. do Dokumentů).
+   Nerozbaluj do Program Files — není potřeba a vyžaduje to admin práva.
+2. Poklepej na „Přepisovátko.bat".
+   (Žádná instalace, žádná admin práva. Černé okno jen krátce
+   problikne — to je v pořádku.)
+
+Tip: Pro pohodlí si na Přepisovátko.bat udělej zástupce na plochu
+(pravé tlačítko → Odeslat → Plocha).
+
+KDYŽ NĚCO NEFUNGUJE
+-------------------
+Spusť „Přepisovátko - diagnostika.bat" — otevře se s konzolí,
+kde je vidět případná chyba. Tu pošli správci aplikace.
+
+POŽADAVKY
+---------
+- Windows 10/11, 64-bit
+- ~1 GB volného místa na disku
+- Bez instalace, bez admin práv, bez internetu
+
+KONTAKT
+-------
+S pomocí AI vytvořil Antonín Lerek v roce 2026, tnlrk@tnlrk.cz
