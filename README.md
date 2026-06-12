@@ -37,8 +37,11 @@ Přepis trvá zhruba 0,5–0,7× délky nahrávky, diarizace přidá ~0,1×.
 
 ## Sestavení ze zdrojů
 
-Repozitář obsahuje pouze zdrojový kód. Postup, jak z něj složit portable balíček
-(stáhnout embeddable Python, modely a ffmpeg), je v **[BUILD.md](BUILD.md)**.
+Repozitář obsahuje pouze zdrojový kód (od v1.2.0 multiplatformní — Windows i macOS).
+
+- **Windows** portable balíček: postup v **[BUILD.md](BUILD.md)**
+- **macOS (Apple Silicon)** `.app`: kompletní postup v **[MAC_BUILD.md](MAC_BUILD.md)**
+  (napsaný tak, aby podle něj build zvládl i Claude Code)
 
 Pro vývoj stačí:
 

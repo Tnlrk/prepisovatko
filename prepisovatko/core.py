@@ -28,13 +28,22 @@ from typing import Callable, Optional
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+IS_WIN = sys.platform == "win32"
+
+# Kořen aplikace: ve zdrojích = složka tohoto souboru; v PyInstaller bundlu
+# (macOS .app) = rozbalené datové soubory (_MEIPASS).
+if getattr(sys, "frozen", False):
+    ROOT = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+else:
+    ROOT = Path(__file__).resolve().parent
 BIN = ROOT / "bin"
 MODELS = ROOT / "models"
 
 # Binárky: preferuj přibalené v bin/, fallback na systémové (vývoj).
-WHISPER_EXE = BIN / "whisper-cli.exe"
-FFMPEG_EXE = BIN / "ffmpeg.exe" if (BIN / "ffmpeg.exe").exists() else "ffmpeg"
+_EXE = ".exe" if IS_WIN else ""
+WHISPER_EXE = BIN / f"whisper-cli{_EXE}"
+_ff = BIN / f"ffmpeg{_EXE}"
+FFMPEG_EXE = _ff if _ff.exists() else "ffmpeg"
 
 WHISPER_MODEL = MODELS / "ggml-large-v3-turbo-q5_0.bin"
 SEG_MODEL = MODELS / "diarize" / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"

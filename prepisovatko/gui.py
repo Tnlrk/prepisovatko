@@ -49,8 +49,8 @@ except ImportError:
 
 import core
 
-__version__ = "1.1.2"
-ICON_PATH = Path(__file__).resolve().parent / "assets" / "icon.ico"
+__version__ = "1.2.0"
+ICON_PATH = core.ROOT / "assets" / "icon.ico"  # core.ROOT funguje i v .app bundlu
 
 # Jazyk → (whisper kód, slovo pro mluvčího ve výstupu)
 LANGS: dict[str, tuple[str, str]] = {
@@ -139,7 +139,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     @staticmethod
     def _apply_icon(window) -> None:
-        if ICON_PATH.exists():
+        # .ico umí jen Windows; macOS .app má ikonu z bundlu (icon.icns)
+        if core.IS_WIN and ICON_PATH.exists():
             try:
                 window.iconbitmap(str(ICON_PATH))
             except Exception:
@@ -632,12 +633,20 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.theme_btn.configure(text="☀" if self._dark else "☾")
 
     def _open_out(self) -> None:
-        if self.last_out_dir:
-            try:
-                os.startfile(self.last_out_dir)  # noqa: S606 (Windows)
-            except OSError:
-                self.status.configure(text="Výstupní složku se nepodařilo otevřít "
-                                           "(byla přesunuta nebo smazána?).")
+        if not self.last_out_dir:
+            return
+        try:
+            if core.IS_WIN:
+                os.startfile(self.last_out_dir)  # noqa: S606
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.run(["open", self.last_out_dir], check=False)
+            else:
+                import subprocess
+                subprocess.run(["xdg-open", self.last_out_dir], check=False)
+        except OSError:
+            self.status.configure(text="Výstupní složku se nepodařilo otevřít "
+                                       "(byla přesunuta nebo smazána?).")
 
     def _help(self) -> None:
         win = ctk.CTkToplevel(self)
