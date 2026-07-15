@@ -27,12 +27,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog
 
-import customtkinter as ctk
-
 # Firemní politika „Untrusted Font Blocking" blokuje načtení CTk fontu pro
-# zaoblené rohy (mimo C:\Windows\Fonts) → CTk spadne na 'circle_shapes'
-# s mizernou kvalitou vykreslení. 'polygon_shapes' (default na macOS) font
-# nepotřebuje a vypadá výrazně líp.
+# zaoblené rohy → CTk při importu vypíše na stderr děsivý warning („rendering
+# quality will be bad!"), který uživatelé hlásí jako chybu. Import proto
+# obalíme (warning potichu zachytíme) a místo nouzového 'circle_shapes'
+# přepneme na 'polygon_shapes' — font nepotřebuje a vypadá prakticky stejně
+# jako plná kvalita.
+_orig_stderr = sys.stderr
+sys.stderr = io.StringIO()
+try:
+    import customtkinter as ctk
+finally:
+    sys.stderr = _orig_stderr
 try:
     from customtkinter.windows.widgets.core_rendering import DrawEngine
     if DrawEngine.preferred_drawing_method == "circle_shapes":
@@ -49,7 +55,7 @@ except ImportError:
 
 import core
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 ICON_PATH = core.ROOT / "assets" / "icon.ico"  # core.ROOT funguje i v .app bundlu
 
 # Jazyk → (whisper kód, slovo pro mluvčího ve výstupu)
