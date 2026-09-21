@@ -8,11 +8,6 @@ from __future__ import annotations
 
 import io
 import sys
-
-# Pod pythonw.exe (bez konzole) jsou sys.stdout/stderr None — jakýkoli výpis
-# (např. warning customtkinteru o zablokovaném fontu na firemních PC) by pak
-# shodil celou aplikaci na AttributeError ještě při importu. Podstrčíme
-# bezpečné buffery DŘÍV, než se importuje cokoli, co by mohlo psát.
 import faulthandler
 import os
 from pathlib import Path
@@ -47,6 +42,30 @@ def flog(msg: str) -> None:
             _logf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
         except Exception:
             pass
+
+
+# Uživatelské nastavení (zatím slovník výrazů) — přežije restart i aktualizaci
+# aplikace, protože leží v %LOCALAPPDATA%, ne ve složce s programem.
+SETTINGS_FILE = LOG_DIR / "settings.json"
+
+
+def _load_settings() -> dict:
+    import json
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_settings(**values) -> None:
+    import json
+    try:
+        data = _load_settings()
+        data.update(values)
+        SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+    except OSError:
+        pass
 
 
 import queue
@@ -84,7 +103,7 @@ except ImportError:
 
 import core
 
-__version__ = "1.2.2"
+__version__ = "1.3.0"
 ICON_PATH = core.ROOT / "assets" / "icon.ico"  # core.ROOT funguje i v .app bundlu
 
 # Jazyk → (whisper kód, slovo pro mluvčího ve výstupu)
@@ -143,7 +162,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.title("Přepisovátko")
         self.geometry("620x840")
-        self.minsize(560, 740)
+        self.minsize(560, 600)
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
 
@@ -165,6 +184,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
              f"| {sys.platform} | CPU {os.cpu_count()} ===")
 
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._apply_icon(self)        # hned…
         self.after(300, lambda: self._apply_icon(self))   # …a po CTk defaultu
         self._center_and_raise()
@@ -190,9 +210,29 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _center_and_raise(self) -> None:
         """Otevřít uprostřed obrazovky a navrch nad ostatními okny."""
         self.update_idletasks()
-        w, h = 620, 840
-        x = max(0, (self.winfo_screenwidth() - w) // 2)
-        y = max(0, (self.winfo_screenheight() - h) // 2 - 20)
+        # výška podle obrazovky: na 1080p se 125–150% zvětšením by 840 nevyšlo
+        try:
+            scale = self._get_window_scaling()
+        except Exception:
+            scale = 1.0
+        # Volná plocha bez hlavního panelu (fyzické px); CTk geometry() násobí
+        # zvětšením jen ROZMĚR okna, pozice zůstává ve fyzických pixelech.
+        left, top = 0, 0
+        right, bottom = self.winfo_screenwidth(), self.winfo_screenheight()
+        if core.IS_WIN:
+            try:
+                import ctypes
+                import ctypes.wintypes as wt
+                r = wt.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0):
+                    left, top, right, bottom = r.left, r.top, r.right, r.bottom
+            except Exception:
+                pass
+        title = round(40 * scale)  # titulková lišta okna
+        w = 620
+        h = max(600, min(840, int((bottom - top - title - 10) / scale)))
+        x = left + max(0, (right - left - round(w * scale)) // 2)
+        y = top + max(0, (bottom - top - title - round(h * scale)) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
         self.lift()
         self.focus_force()
@@ -212,9 +252,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     # ----------------------------------------------------------- helpers UI
     @staticmethod
-    def _section(parent, title: str) -> ctk.CTkFrame:
+    def _section(parent, title: str, expand: bool = False) -> ctk.CTkFrame:
         frame = ctk.CTkFrame(parent)
-        frame.pack(fill="x", padx=18, pady=(0, 12))
+        frame.pack(fill="both" if expand else "x", expand=expand, padx=18, pady=(0, 12))
         ctk.CTkLabel(frame, text=title, font=("", 11, "bold"),
                      text_color=("gray25", "gray75")).pack(anchor="w", padx=14, pady=(10, 0))
         return frame
@@ -241,7 +281,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.theme_btn.pack(side="right", padx=(0, 8))
 
         # ── Nahrávky (fronta) ─────────────────────────────────────
-        files = self._section(self, "NAHRÁVKY")
+        files = self._section(self, "NAHRÁVKY", expand=True)
         bar = ctk.CTkFrame(files, fg_color="transparent")
         bar.pack(fill="x", padx=14, pady=(6, 4))
         ctk.CTkButton(bar, text="Přidat soubory…", width=150,
@@ -254,7 +294,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                       command=self._clear_all).pack(side="left")
         self.count_lbl = ctk.CTkLabel(bar, text="", text_color=("gray25", "gray75"))
         self.count_lbl.pack(side="right")
-        self.list = ctk.CTkScrollableFrame(files, height=200, fg_color="transparent")
+        self.list = ctk.CTkScrollableFrame(files, height=120, fg_color="transparent")
+        try:  # posuvník CTk má výchozí výšku 200 px a tím by frontu natahoval
+            self.list._scrollbar.configure(height=0)
+        except Exception:
+            pass
         self.list.pack(fill="both", expand=True, padx=14, pady=(0, 12))
         self.hint = ctk.CTkLabel(
             self.list,
@@ -277,9 +321,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                                     command=self._toggle_diar)
         self.diar.select()
         self.diar.pack(side="left")
-        r2b = ctk.CTkFrame(opt, fg_color="transparent")
-        r2b.pack(fill="x", padx=14, pady=4)
-        ctk.CTkLabel(r2b, text="Počet mluvčích:").pack(side="left")
+        r2b = r2  # počet mluvčích na stejném řádku jako diarizace (šetří výšku)
+        ctk.CTkLabel(r2b, text="Počet:").pack(side="left", padx=(18, 0))
         self.nspk = ctk.CTkComboBox(r2b, values=SPEAKER_CHOICES, width=135,
                                     command=lambda _v: self._nspk_changed())
         self.nspk.set("Automaticky")
@@ -292,6 +335,19 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         entry.bind("<Return>", lambda e: self.focus())  # Enter = potvrdit
         self.nspk_info = ctk.CTkLabel(r2b, text="", width=24, font=("", 15, "bold"))
         self.nspk_info.pack(side="left")
+        # Slovník výrazů → nápověda pro whisper (jména, zkratky, termíny)
+        rv = ctk.CTkFrame(opt, fg_color="transparent")
+        rv.pack(fill="x", padx=14, pady=(8, 0))
+        ctk.CTkLabel(rv, text="Slovník výrazů (jména, zkratky — oddělené čárkou):"
+                     ).pack(side="left")
+        self.vocab_cnt = ctk.CTkLabel(rv, text="", font=("", 11),
+                                      text_color=("gray25", "gray75"))
+        self.vocab_cnt.pack(side="right")
+        self.vocab = ctk.CTkTextbox(opt, height=52, wrap="word", border_width=1)
+        self.vocab.pack(fill="x", padx=14, pady=(2, 0))
+        self.vocab.insert("1.0", _load_settings().get("vocabulary", ""))
+        self.vocab.bind("<KeyRelease>", lambda e: self._vocab_changed())
+        self._vocab_changed()
         r3 = ctk.CTkFrame(opt, fg_color="transparent")
         r3.pack(fill="x", padx=14, pady=(4, 12))
         ctk.CTkButton(r3, text="Výstupní složka…", width=150, fg_color=GRAY,
@@ -334,8 +390,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                                         text_color=("gray25", "gray75"))
             self.sys_lbl.pack(side="bottom", fill="x", padx=18, pady=(0, 8))
 
-        self.log = ctk.CTkTextbox(self, height=100, fg_color=GRAY)
-        self.log.pack(fill="both", expand=False, padx=18, pady=(8, 6))
+        self.log = ctk.CTkTextbox(self, height=70, fg_color=GRAY)
+        self.log.pack(fill="x", padx=18, pady=(8, 6))
         self.log.configure(state="disabled")
 
     # ----------------------------------------------------------- fronta
@@ -528,10 +584,37 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._stop_enabled(True)
         code, word = LANGS[self.lang.get()]
         nspk, _ = self._parse_nspk()
+        vocab_raw = self._vocab_text()
+        _save_settings(vocabulary=vocab_raw)
         opts = dict(do_diarize=bool(self.diar.get()), lang=code, speaker_word=word,
-                    num_speakers=nspk)
+                    num_speakers=nspk, prompt=core.build_prompt(vocab_raw))
         self.worker = threading.Thread(target=self._run, args=(opts,), daemon=True)
         self.worker.start()
+
+    def _vocab_text(self) -> str:
+        return self.vocab.get("1.0", "end").strip()
+
+    def _vocab_changed(self) -> None:
+        """Počítadlo délky slovníku; nad limitem červeně (zbytek se nepoužije)."""
+        text = self._vocab_text()
+        # délka po normalizaci (bez duplicit), ale PŘED zkrácením
+        items = {" ".join(p.split()).lower(): " ".join(p.split())
+                 for p in text.replace(";", ",").replace("\n", ",").split(",")
+                 if p.strip()}
+        n = len(", ".join(items.values()))
+        if not items:
+            self.vocab_cnt.configure(text="")
+        elif n > core.PROMPT_MAX_CHARS:
+            self.vocab_cnt.configure(text=f"{n}/{core.PROMPT_MAX_CHARS} — příliš dlouhé, "
+                                          "konec se nepoužije",
+                                     text_color=STATUS["error"][1])
+        else:
+            self.vocab_cnt.configure(text=f"{n}/{core.PROMPT_MAX_CHARS}",
+                                     text_color=("gray25", "gray75"))
+
+    def _on_close(self) -> None:
+        _save_settings(vocabulary=self._vocab_text())
+        self.destroy()
 
     def _stop(self) -> None:
         self.stop_all.set()
@@ -572,6 +655,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     self.msgq.put(("progress", (_id, msg, frac, eta)))
                 res = core.process(it.path, out_dir, do_diarize=opts["do_diarize"],
                                    num_speakers=opts["num_speakers"], lang=opts["lang"],
+                                   prompt=opts["prompt"],
                                    speaker_word=opts["speaker_word"], out_stem=stem,
                                    cb=cb, cancel=self.cancel)
                 self.last_out_dir = str(out_dir)
@@ -708,10 +792,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         win = ctk.CTkToplevel(self)
         win.title("O aplikaci")
         # vycentrovat nad hlavní okno (ne na výchozí pozici bokem)
-        ww, wh = 560, 560
+        ww, wh = 560, 600
         self.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - ww) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - wh) // 2
+        try:
+            scale = self._get_window_scaling()
+        except Exception:
+            scale = 1.0
+        x = self.winfo_rootx() + (self.winfo_width() - round(ww * scale)) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - round(wh * scale)) // 2
         win.geometry(f"{ww}x{wh}+{max(0, x)}+{max(0, y)}")
         win.transient(self)        # vždy nad hlavním oknem
         win.resizable(False, False)
@@ -733,6 +821,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             "2. Pořadí ve frontě můžeš měnit šipkami ▲▼, soubory odebrat křížkem.\n"
             "3. Vyber jazyk nahrávky a zda chceš detekci mluvčích.\n"
             "   Počet mluvčích nech na „Automaticky“, nebo zadej ručně, pokud ho znáš.\n"
+            "   Do „Slovníku výrazů“ napiš jména účastníků, zkratky a odborné\n"
+            "   termíny, které v nahrávce zazní — přepis je pak zapíše správně.\n"
+            "   Slovník si aplikace pamatuje i po zavření.\n"
             "4. Spusť přepis. Frontu lze upravovat i během běhu.\n"
             "5. Výsledek najdeš vedle vstupu nebo ve zvolené výstupní složce:\n"
             "   • soubor .txt — čistý přepis textu\n"

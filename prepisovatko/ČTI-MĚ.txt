@@ -1,4 +1,4 @@
-PŘEPISOVÁTKO v1.2.2
+PŘEPISOVÁTKO v1.3.0
 ====================
 Lokální (offline) přepis nahrávek z porad s detekcí mluvčích.
 Nic se neposílá na internet — vše běží na tomto počítači.
@@ -13,6 +13,14 @@ SPUŠTĚNÍ
 
 Tip: Pro pohodlí si na Přepisovátko.bat udělej zástupce na plochu
 (pravé tlačítko → Odeslat → Plocha).
+
+SLOVNÍK VÝRAZŮ (NOVINKA)
+------------------------
+Do pole „Slovník výrazů" v Nastavení napiš jména účastníků, zkratky a odborné
+termíny, které v nahrávce zazní (oddělené čárkou), např.:
+  Dvořáková, Novák, ČSSZ, OSVČ, eNeschopenka, SharePoint
+Přepis je pak zapíše správně mnohem častěji. Slovník si aplikace pamatuje.
+Stačí klíčové výrazy (max. cca 400 znaků) — delší text se nepoužije celý.
 
 KDYŽ NĚCO NEFUNGUJE
 -------------------

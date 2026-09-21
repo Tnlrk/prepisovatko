@@ -8,7 +8,8 @@ pro testování.
 
 CLI:
     python core.py <audio> [--out-dir DIR] [--no-diarize]
-                   [--threshold 0.7] [--lang cs] [--threads N]
+                   [--threshold 0.7] [--speakers N] [--lang cs]
+                   [--prompt "ČSSZ, OSVČ, Novák"] [--threads N]
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +63,9 @@ MIN_SPEAKER_SEC = 30.0       # ...A zároveň pod 30 s → šum, přiřadit nejb
 # zpomaluje (změřeno na OmniBook: 8t=8.4s, 22t=9.9s na 90s audia). Whisper
 # naproti tomu vlákna rád využije, proto má vlastní (vyšší) počet.
 DIARIZE_MAX_THREADS = 8
+# Slovník výrazů → whisper --prompt. Whisper bere max ~224 tokenů nápovědy
+# (a s --carry-initial-prompt se s ní dělí o kontext) → držíme ji krátkou.
+PROMPT_MAX_CHARS = 400
 
 ProgressCb = Optional[Callable[[str, float], None]]
 
@@ -167,14 +172,64 @@ def _stream_proc(cmd: list[str], on_line: Callable[[str], bool],
 # --------------------------------------------------------------------------- #
 # 2) Přepis (whisper.cpp jako subprocess, JSON výstup)
 # --------------------------------------------------------------------------- #
+def build_prompt(raw: Optional[str]) -> Optional[str]:
+    """Slovník výrazů z GUI (oddělený čárkami/středníky/řádky) → nápověda pro
+    whisper: bez duplicit, zkrácená na PROMPT_MAX_CHARS. Prázdný → None."""
+    items: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,;\n]+", raw or ""):
+        w = " ".join(part.split())
+        if w and w.lower() not in seen:
+            seen.add(w.lower())
+            items.append(w)
+    if not items:
+        return None
+    text = ", ".join(items)
+    if len(text) > PROMPT_MAX_CHARS:
+        text = text[:PROMPT_MAX_CHARS].rsplit(",", 1)[0]
+    return text + "."
+
+
+def _argv_safe(s: str) -> str:
+    """whisper-cli na Windows čte parametry v ANSI kódové stránce systému
+    (cp1250), text ale interpretuje jako UTF-8 → diakritika v --prompt by se
+    rozbila (ověřeno: „Hrubeš" pomohlo až po překódování). Předáme proto řetězec,
+    jehož převod do ANSI dá přesně UTF-8 bajty originálu. Znak, který to
+    nedovolí, nahradíme verzí bez diakritiky."""
+    if not IS_WIN:
+        return s
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.GetACP() == 65001:  # systém už běží v UTF-8
+            return s
+    except Exception:
+        pass
+    out = []
+    for ch in s:
+        b = ch.encode("utf-8")
+        try:
+            w = b.decode("mbcs")
+            if w.encode("mbcs") == b:
+                out.append(w)
+                continue
+        except UnicodeError:
+            pass
+        out.append(unicodedata.normalize("NFKD", ch).encode("ascii", "ignore").decode())
+    return "".join(out)
+
+
 def transcribe(wav_path: str | Path, lang: str = "cs",
                threads: Optional[int] = None, cb: ProgressCb = None,
+               prompt: Optional[str] = None,
                cancel: Optional[threading.Event] = None) -> list[Seg]:
     threads = threads or _default_threads()
     with tempfile.TemporaryDirectory() as td:
         prefix = Path(td) / "out"
         cmd = [str(WHISPER_EXE), "-m", str(WHISPER_MODEL), "-l", lang,
-               "-t", str(threads), "-pp", "-oj", "-of", str(prefix), "-f", str(wav_path)]
+               "-t", str(threads), "-pp", "-oj", "-of", str(prefix)]
+        if prompt:  # slovník výrazů pro celou nahrávku, ne jen prvních 30 s
+            cmd += ["--prompt", _argv_safe(prompt), "--carry-initial-prompt"]
+        cmd += ["-f", str(wav_path)]
         _log(cb, "Přepisuji…")
         last = [-2]
 
@@ -444,6 +499,7 @@ def _check_runtime(do_diarize: bool) -> None:
 def process(src: str | Path, out_dir: str | Path, *, do_diarize: bool = True,
             threshold: float = DEFAULT_THRESHOLD, num_speakers: Optional[int] = None,
             lang: str = "cs", speaker_word: str = "Mluvčí",
+            prompt: Optional[str] = None,
             out_stem: Optional[str] = None,
             threads: Optional[int] = None, cb: ProgressCb = None,
             cancel: Optional[threading.Event] = None) -> dict:
@@ -489,7 +545,7 @@ def process(src: str | Path, out_dir: str | Path, *, do_diarize: bool = True,
             cb(m, 0.85 + 0.15 * f if f >= 0 else f, eta)
 
         w_t0[0] = time.perf_counter()
-        transcript = transcribe(wav, lang=lang, threads=threads,
+        transcript = transcribe(wav, lang=lang, threads=threads, prompt=prompt,
                                 cb=(t_cb if cb else None), cancel=cancel)
 
         stem = out_stem or src.stem
@@ -537,11 +593,13 @@ def main() -> None:
     ap.add_argument("--speakers", type=int, default=None,
                     help="pevný počet mluvčích (jinak automat)")
     ap.add_argument("--lang", default="cs")
+    ap.add_argument("--prompt", default=None,
+                    help="slovník výrazů (jména, zkratky), oddělené čárkou")
     ap.add_argument("--threads", type=int, default=None)
     args = ap.parse_args()
     process(args.audio, args.out_dir, do_diarize=not args.no_diarize,
             threshold=args.threshold, num_speakers=args.speakers,
-            lang=args.lang, threads=args.threads)
+            lang=args.lang, prompt=build_prompt(args.prompt), threads=args.threads)
 
 
 if __name__ == "__main__":
