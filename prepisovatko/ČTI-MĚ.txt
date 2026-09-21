@@ -1,4 +1,4 @@
-PŘEPISOVÁTKO v1.1.2
+PŘEPISOVÁTKO v1.2.2
 ====================
 Lokální (offline) přepis nahrávek z porad s detekcí mluvčích.
 Nic se neposílá na internet — vše běží na tomto počítači.
@@ -16,8 +16,13 @@ Tip: Pro pohodlí si na Přepisovátko.bat udělej zástupce na plochu
 
 KDYŽ NĚCO NEFUNGUJE
 -------------------
-Spusť „Přepisovátko - diagnostika.bat" — otevře se s konzolí,
-kde je vidět případná chyba. Tu pošli správci aplikace.
+Aplikace si vede záznam o průběhu a chybách. Pošli správci soubor:
+  %LOCALAPPDATA%\Prepisovatko\prepisovatko.log
+(do adresního řádku Průzkumníka napiš %LOCALAPPDATA%\Prepisovatko)
+Přidej i informaci, o jaký soubor šlo (formát, délka nahrávky).
+
+Pokud se aplikace vůbec neotevře, spusť „Přepisovátko - diagnostika.bat"
+a pošli text, který se vypíše v černém okně.
 
 POŽADAVKY
 ---------

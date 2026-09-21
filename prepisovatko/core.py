@@ -115,6 +115,55 @@ def wav_duration(wav_path: str | Path) -> float:
         return wf.getnframes() / float(wf.getframerate())
 
 
+def _rc_str(rc: int) -> str:
+    """Návratový kód čitelně; nativní pád na Windows je např. 0xC0000005."""
+    if IS_WIN and (rc < 0 or rc > 0xFFFF):
+        return f"kód 0x{rc & 0xFFFFFFFF:08X}"
+    return f"kód {rc}"
+
+
+def _stream_proc(cmd: list[str], on_line: Callable[[str], bool],
+                 cancel: Optional[threading.Event], *, read_stderr: bool,
+                 env: Optional[dict] = None) -> tuple[int, list[str]]:
+    """Spustí proces, každý řádek výstupu předá on_line (True = zpracováno,
+    jinak se řádek uloží do „ocasu" pro chybové hlášení). Cancel proces zabije.
+    Vrací (returncode, posledních ~20 nezpracovaných řádků)."""
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL if read_stderr else subprocess.PIPE,
+        stderr=subprocess.PIPE if read_stderr else subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=_NO_WINDOW, env=env)
+    stream = proc.stderr if read_stderr else proc.stdout
+    # Hlídací vlákno: čtení výstupu blokuje mezi řádky, proto cancel řešíme
+    # nezávisle — pollujeme každých 0,2 s a proces rovnou zabijeme.
+    stop_watch = threading.Event()
+
+    def _watch():
+        while not stop_watch.wait(0.2):
+            if cancel is not None and cancel.is_set():
+                proc.kill()
+                return
+
+    watcher = threading.Thread(target=_watch, daemon=True) if cancel else None
+    if watcher:
+        watcher.start()
+    tail: list[str] = []
+    try:
+        for line in stream:  # type: ignore[union-attr]
+            if not on_line(line) and line.strip():
+                tail.append(line)
+                del tail[:-20]
+        proc.wait()
+    finally:
+        stop_watch.set()
+        if watcher:
+            watcher.join(timeout=1)
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+    return proc.returncode, tail
+
+
 # --------------------------------------------------------------------------- #
 # 2) Přepis (whisper.cpp jako subprocess, JSON výstup)
 # --------------------------------------------------------------------------- #
@@ -127,46 +176,22 @@ def transcribe(wav_path: str | Path, lang: str = "cs",
         cmd = [str(WHISPER_EXE), "-m", str(WHISPER_MODEL), "-l", lang,
                "-t", str(threads), "-pp", "-oj", "-of", str(prefix), "-f", str(wav_path)]
         _log(cb, "Přepisuji…")
+        last = [-2]
+
+        def _on_line(line: str) -> bool:
+            m = _PROGRESS_RE.search(line)
+            if not m:
+                return False
+            pct = int(m.group(1))
+            if pct >= last[0] + 2 or pct == 100:
+                last[0] = pct
+                _log(cb, f"Přepisuji… {pct} %", pct / 100.0)
+            return True
+
         # whisper-cli píše průběh (-pp) i timings na stderr → streamujeme a parsujeme.
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                text=True, encoding="utf-8", errors="replace",
-                                creationflags=_NO_WINDOW)
-        # Hlídací vlákno: čtení stderr blokuje mezi řádky, proto cancel řešíme
-        # nezávisle — pollujeme každých 0,2 s a whisper rovnou zabijeme.
-        stop_watch = threading.Event()
-
-        def _watch():
-            while not stop_watch.wait(0.2):
-                if cancel is not None and cancel.is_set():
-                    proc.kill()
-                    return
-
-        watcher = threading.Thread(target=_watch, daemon=True) if cancel else None
-        if watcher:
-            watcher.start()
-
-        err_tail: list[str] = []
-        last = -2
-        try:
-            for line in proc.stderr:  # type: ignore[union-attr]
-                m = _PROGRESS_RE.search(line)
-                if m:
-                    pct = int(m.group(1))
-                    if pct >= last + 2 or pct == 100:
-                        last = pct
-                        _log(cb, f"Přepisuji… {pct} %", pct / 100.0)
-                elif line.strip():
-                    err_tail.append(line)
-            proc.wait()
-        finally:
-            stop_watch.set()
-            if watcher:
-                watcher.join(timeout=1)
-
-        if cancel is not None and cancel.is_set():
-            raise Cancelled()
-        if proc.returncode != 0:
-            raise RuntimeError("whisper selhal:\n" + "".join(err_tail[-15:]))
+        rc, tail = _stream_proc(cmd, _on_line, cancel, read_stderr=True)
+        if rc != 0:
+            raise RuntimeError(f"whisper selhal ({_rc_str(rc)}):\n" + "".join(tail))
         data = json.loads(Path(f"{prefix}.json").read_text(encoding="utf-8"))
 
     segs: list[Seg] = []
@@ -230,6 +255,78 @@ def diarize(samples: np.ndarray, threshold: float = DEFAULT_THRESHOLD,
     segs = [Seg(start=r.start, end=r.end, speaker=r.speaker) for r in raw]
     # Pevný počet → výsledek je autoritativní, jen přečíslovat. Automat → filtr šumu.
     return _renumber(segs) if fixed else _filter_and_renumber(segs)
+
+
+class DiarizationFailed(RuntimeError):
+    """Diarizace selhala (vč. nativního pádu) — přepis lze uložit bez mluvčích."""
+
+
+def _worker_python() -> Optional[Path]:
+    """Python pro podproces: pod pythonw.exe vezmeme sourozence python.exe
+    (spolehlivý stdout; okno konzole potlačí CREATE_NO_WINDOW). V PyInstaller
+    bundlu samostatný python není → None (diarizace poběží v procesu)."""
+    if getattr(sys, "frozen", False):
+        return None
+    exe = Path(sys.executable)
+    if IS_WIN and exe.name.lower() == "pythonw.exe":
+        alt = exe.with_name("python.exe")
+        if alt.exists():
+            return alt
+    return exe
+
+
+def diarize_isolated(wav_path: str | Path, threshold: float = DEFAULT_THRESHOLD,
+                     num_speakers: Optional[int] = None,
+                     threads: Optional[int] = None, cb: ProgressCb = None,
+                     cancel: Optional[threading.Event] = None) -> list[Seg]:
+    """Diarizace v samostatném procesu. sherpa-onnx/onnxruntime je nativní kód —
+    kdyby spadl (nebo došla paměť), zabil by celou aplikaci bez hlášky. V podprocesu
+    se pád projeví jen jako DiarizationFailed a aplikace uloží přepis bez mluvčích."""
+    py = _worker_python()
+    if py is None:
+        samples = read_wav16k_mono(wav_path)
+        return diarize(samples, threshold=threshold, num_speakers=num_speakers,
+                       threads=threads, cb=cb, cancel=cancel)
+    _log(cb, "Rozpoznávám mluvčí…")
+    with tempfile.TemporaryDirectory() as td:
+        out_json = Path(td) / "diar.json"
+        cmd = [str(py), str(Path(__file__).resolve()), "--diar-worker",
+               str(wav_path), str(out_json), str(threshold),
+               str(num_speakers or 0), str(threads or 0)]
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+
+        def _on_line(line: str) -> bool:
+            if not line.startswith("@@P "):
+                return False
+            try:
+                f = float(line[4:])
+            except ValueError:
+                return False
+            _log(cb, f"Rozpoznávám mluvčí… {int(f * 100)} %", f)
+            return True
+
+        rc, tail = _stream_proc(cmd, _on_line, cancel, read_stderr=False, env=env)
+        if rc != 0 or not out_json.exists():
+            raise DiarizationFailed(
+                f"Rozpoznání mluvčích selhalo ({_rc_str(rc)}).\n" + "".join(tail))
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+    return [Seg(start=s, end=e, speaker=k) for s, e, k in data]
+
+
+def _diar_worker(argv: list[str]) -> int:
+    """Vstupní bod podprocesu: core.py --diar-worker <wav> <out.json> <thr> <n> <t>."""
+    wav, out_json, thr, nspk, thr_n = argv
+    samples = read_wav16k_mono(wav)
+
+    def _cb(_m: str, f: float) -> None:
+        if f >= 0:
+            print(f"@@P {f:.4f}", flush=True)
+
+    segs = diarize(samples, threshold=float(thr), num_speakers=int(nspk) or None,
+                   threads=int(thr_n) or None, cb=_cb)
+    Path(out_json).write_text(
+        json.dumps([[s.start, s.end, s.speaker] for s in segs]), encoding="utf-8")
+    return 0
 
 
 def _renumber(segs: list[Seg]) -> list[Seg]:
@@ -395,28 +492,43 @@ def process(src: str | Path, out_dir: str | Path, *, do_diarize: bool = True,
         transcript = transcribe(wav, lang=lang, threads=threads,
                                 cb=(t_cb if cb else None), cancel=cancel)
 
-        diar: list[Seg] = []
+        stem = out_stem or src.stem
+        txt_path = out_dir / f"{stem}.txt"
+        srt_path = out_dir / f"{stem}.srt"
+        # Pojistka: přepis uložit hned (zatím bez mluvčích). Kdyby cokoli dalšího
+        # selhalo, uživatel o hodiny práce whisperu nepřijde.
+        write_txt(transcript, txt_path, with_speakers=False)
+        write_srt(transcript, srt_path, with_speakers=False)
+
+        diar_error: Optional[str] = None
         if do_diarize:
-            samples = read_wav16k_mono(wav)
             d_t0[0] = time.perf_counter()
-            diar = diarize(samples, threshold=threshold, num_speakers=num_speakers,
-                           threads=threads, cb=(d_cb if cb else None), cancel=cancel)
-            transcript = merge(transcript, diar)
+            try:
+                diar = diarize_isolated(wav, threshold=threshold,
+                                        num_speakers=num_speakers, threads=threads,
+                                        cb=(d_cb if cb else None), cancel=cancel)
+                transcript = merge(transcript, diar)
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001 — přepis bez mluvčích je lepší než nic
+                diar_error = str(e).strip()
+                _log(cb, "Rozpoznání mluvčích selhalo — přepis uložen bez mluvčích.")
 
-    stem = out_stem or src.stem
-    txt_path = out_dir / f"{stem}.txt"
-    srt_path = out_dir / f"{stem}.srt"
-    write_txt(transcript, txt_path, with_speakers=do_diarize, spk_word=speaker_word)
-    write_srt(transcript, srt_path, with_speakers=do_diarize, spk_word=speaker_word)
+    with_spk = do_diarize and diar_error is None
+    write_txt(transcript, txt_path, with_speakers=with_spk, spk_word=speaker_word)
+    write_srt(transcript, srt_path, with_speakers=with_spk, spk_word=speaker_word)
 
-    n_spk = len({s.speaker for s in transcript if s.speaker >= 0}) if do_diarize else 0
+    n_spk = len({s.speaker for s in transcript if s.speaker >= 0}) if with_spk else 0
     elapsed = time.perf_counter() - t0
     _log(cb, f"Hotovo za {elapsed:.0f}s. Mluvčích: {n_spk}. → {txt_path.name}, {srt_path.name}")
     return {"txt": str(txt_path), "srt": str(srt_path),
-            "segments": len(transcript), "speakers": n_spk, "elapsed": elapsed}
+            "segments": len(transcript), "speakers": n_spk, "elapsed": elapsed,
+            "duration": duration, "diar_error": diar_error}
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--diar-worker":
+        sys.exit(_diar_worker(sys.argv[2:]))
     ap = argparse.ArgumentParser(description="Přepisovátko — přepis + diarizace (CLI)")
     ap.add_argument("audio")
     ap.add_argument("--out-dir", default=".")

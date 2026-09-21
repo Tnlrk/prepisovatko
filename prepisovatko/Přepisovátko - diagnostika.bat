@@ -13,5 +13,6 @@ echo Pripadne vypisy vyse jsou jen informacni, nejde o chyby.
 echo.
 echo Spravci aplikace piste jen kdyz se okno aplikace vubec neotevrelo.
 echo V tom pripade mu posleTE text vypsany vyse (staci foto obrazovky).
+echo Zaznam o behu aplikace (log): %LOCALAPPDATA%\Prepisovatko\prepisovatko.log
 echo ------------------------------------------------------------------
 pause

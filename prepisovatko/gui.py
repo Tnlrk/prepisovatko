@@ -13,18 +13,47 @@ import sys
 # (např. warning customtkinteru o zablokovaném fontu na firemních PC) by pak
 # shodil celou aplikaci na AttributeError ještě při importu. Podstrčíme
 # bezpečné buffery DŘÍV, než se importuje cokoli, co by mohlo psát.
-if sys.stdout is None:
-    sys.stdout = io.StringIO()
-if sys.stderr is None:
-    sys.stderr = io.StringIO()
-
+import faulthandler
 import os
+from pathlib import Path
+
+# Trvalý log (%LOCALAPPDATA%\Prepisovatko\prepisovatko.log). faulthandler do něj
+# zapíše i NATIVNÍ pád (onnxruntime, Tk…), po kterém by jinak aplikace jen
+# beze slova zmizela — díky tomu jde pád u uživatele dohledat.
+LOG_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Prepisovatko"
+LOG_FILE = LOG_DIR / "prepisovatko.log"
+_logf = None
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > 2_000_000:
+        LOG_FILE.replace(LOG_FILE.with_suffix(".old.log"))
+    _logf = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+    faulthandler.enable(_logf)
+except OSError:
+    _logf = None
+
+# Pod pythonw.exe (bez konzole) jsou sys.stdout/stderr None — jakýkoli výpis
+# by pak shodil celou aplikaci na AttributeError ještě při importu. Přesměrujeme
+# je do logu (nebo aspoň do paměti) DŘÍV, než se importuje cokoli dalšího.
+if sys.stdout is None:
+    sys.stdout = _logf or io.StringIO()
+if sys.stderr is None:
+    sys.stderr = _logf or io.StringIO()
+
+
+def flog(msg: str) -> None:
+    if _logf:
+        try:
+            _logf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+        except Exception:
+            pass
+
+
 import queue
 import threading
 import time
 import traceback
 from dataclasses import dataclass
-from pathlib import Path
 from tkinter import filedialog
 
 # Firemní politika „Untrusted Font Blocking" blokuje načtení CTk fontu pro
@@ -55,7 +84,7 @@ except ImportError:
 
 import core
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 ICON_PATH = core.ROOT / "assets" / "icon.ico"  # core.ROOT funguje i v .app bundlu
 
 # Jazyk → (whisper kód, slovo pro mluvčího ve výstupu)
@@ -128,6 +157,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.last_out_dir: str | None = None
         self.out_dir: Path | None = None
         self.cur: dict = {}
+        # výjimky v Tk callbackách do logu (jinak by zmizely v neviditelné konzoli)
+        self.report_callback_exception = (
+            lambda *exc: flog("TK CALLBACK ERROR:\n"
+                              + "".join(traceback.format_exception(*exc))))
+        flog(f"=== Přepisovátko {__version__} start | Python {sys.version.split()[0]} "
+             f"| {sys.platform} | CPU {os.cpu_count()} ===")
 
         self._build()
         self._apply_icon(self)        # hned…
@@ -528,6 +563,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             used_stems.add((str(out_dir), stem))
             self.msgq.put(("file", (it.id, it.path.name)))
             try:
+                size_mb = it.path.stat().st_size / 2**20
+            except OSError:
+                size_mb = -1
+            flog(f"START {it.path} ({size_mb:.1f} MB) opts={opts}")
+            try:
                 def cb(msg: str, frac: float, eta=None, _id=it.id):
                     self.msgq.put(("progress", (_id, msg, frac, eta)))
                 res = core.process(it.path, out_dir, do_diarize=opts["do_diarize"],
@@ -535,17 +575,27 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                                    speaker_word=opts["speaker_word"], out_stem=stem,
                                    cb=cb, cancel=self.cancel)
                 self.last_out_dir = str(out_dir)
-                info = (f"{res['speakers']} mluvčích · {_fmt(res['elapsed'])}"
-                        if opts["do_diarize"] else _fmt(res["elapsed"]))
+                if res.get("diar_error"):
+                    info = f"bez mluvčích ⚠ · {_fmt(res['elapsed'])}"
+                    self.msgq.put(("log", f"⚠ {it.path.name} — mluvčí se nepodařilo "
+                                          "rozpoznat, přepis je uložen bez nich."))
+                    flog(f"DIAR FAIL {it.path.name}: {res['diar_error']}")
+                elif opts["do_diarize"]:
+                    info = f"{res['speakers']} mluvčích · {_fmt(res['elapsed'])}"
+                else:
+                    info = _fmt(res["elapsed"])
                 self.msgq.put(("status", (it.id, "done", info)))
                 self.msgq.put(("log", f"✓ {it.path.name} — {info}"))
+                flog(f"DONE {it.path.name}: {info}, audio {res.get('duration', 0):.0f}s")
             except core.Cancelled:
                 self.msgq.put(("status", (it.id, "cancelled", "zrušeno")))
                 self.msgq.put(("log", f"⊘ {it.path.name} — zrušeno"))
+                flog(f"CANCELLED {it.path.name}")
             except Exception:
+                tb = traceback.format_exc()
                 self.msgq.put(("status", (it.id, "error", "chyba")))
-                self.msgq.put(("log", f"✗ {it.path.name} — CHYBA:\n"
-                                      + traceback.format_exc()))
+                self.msgq.put(("log", f"✗ {it.path.name} — CHYBA:\n" + tb))
+                flog(f"ERROR {it.path.name}:\n{tb}")
         self.msgq.put(("done", None))
 
     # ------------------------------------------------- UI aktualizace
@@ -695,6 +745,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             "pomalý a hůř použitelný pro jinou práci. U delších nahrávek to může trvat\n"
             "i desítky minut (přepis zhruba 0,5–0,7× délky nahrávky, diarizace přidá\n"
             "~0,1×). Tlačítkem Zastavit lze zpracování kdykoli okamžitě přerušit.\n\n"
+            "PŘI POTÍŽÍCH\n"
+            "Aplikace si vede záznam (log) — při hlášení chyby pošli správci soubor:\n"
+            f"{LOG_FILE}\n\n"
             "Technologie: whisper.cpp (přepis) + sherpa-onnx (diarizace), CPU-only.\n\n"
             "S pomocí AI vytvořil Antonín Lerek v roce 2026\n"
             "tnlrk@tnlrk.cz")
