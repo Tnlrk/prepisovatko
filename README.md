@@ -15,6 +15,7 @@ Vše běží na vašem počítači — nic se neposílá na internet.
 - 🎬 **Audio i video** na vstupu — mp3, wav, m4a, flac, ogg… i mp4, mkv, mov, avi, webm (vytáhne se zvuková stopa)
 - 📄 **Výstup** do `.txt` (čistý přepis) a `.srt` (titulky s časy)
 - 📚 **Slovník výrazů** — jména účastníků, zkratky a termíny, které má přepis znát (ČSSZ, OSVČ, Dvořáková…)
+- ⚡ **Volitelný výkon** — Na pozadí / Vyvážený / Plný, přepínatelné i během přepisu (na PC se dá dál pracovat)
 - 📂 **Dávkové zpracování** — fronta souborů, kterou lze upravovat i za běhu
 - 🔒 **Plně offline** — žádný internet, žádný účet, žádná instalace, bez admin práv
 - 🖥️ **CPU-only** — funguje na běžných noteboocích (AMD i Intel), nepotřebuje grafickou kartu

@@ -99,10 +99,15 @@ def _log(cb: ProgressCb, msg: str, frac: float = -1.0) -> None:
 def to_wav16k(src: str | Path, dst_wav: str | Path) -> None:
     cmd = [str(FFMPEG_EXE), "-v", "error", "-y", "-i", str(src),
            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dst_wav)]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          creationflags=_NO_WINDOW)
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, creationflags=_NO_WINDOW)
+    _track(proc)
+    try:
+        _, err = proc.communicate()
+    finally:
+        _untrack(proc)
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg selhal: {proc.stderr.decode(errors='replace')}")
+        raise RuntimeError(f"ffmpeg selhal: {err.decode(errors='replace')}")
 
 
 def read_wav16k_mono(wav_path: str | Path) -> np.ndarray:
@@ -118,6 +123,95 @@ def read_wav16k_mono(wav_path: str | Path) -> np.ndarray:
 def wav_duration(wav_path: str | Path) -> float:
     with wave.open(str(wav_path), "rb") as wf:
         return wf.getnframes() / float(wf.getframerate())
+
+
+# --------------------------------------------------------------------------- #
+# Řízení výkonu — lze měnit i ZA BĚHU přepisu
+# --------------------------------------------------------------------------- #
+# Úroveň → podíl logických jader, která smí přepis používat. Počet vláken
+# whisperu se nemění (ten je daný při startu); omezuje se afinita k jádrům
+# a priorita procesu, obojí jde přenastavit běžícímu procesu. Změřeno: whisper
+# -t 22 omezený na 12 jader je stejně rychlý jako -t 12 (27,4 vs 28,0 s),
+# na 6 jader o ~15 % pomalejší — za možnost měnit výkon za běhu to stojí.
+POWER_LEVELS = ("low", "balanced", "max")
+_POWER_FRAC = {"low": 0.25, "balanced": 0.5, "max": 1.0}
+_power = "max"
+_power_epoch = 0            # zvýší se při každé změně → přepočet odhadu času
+_active_pids: set[int] = set()
+_power_lock = threading.Lock()
+
+
+def set_power(level: str) -> None:
+    """Nastaví výkon pro běžící i budoucí podprocesy (whisper, diarizace, ffmpeg)."""
+    global _power, _power_epoch
+    if level not in _POWER_FRAC:
+        return
+    with _power_lock:
+        if level == _power:
+            return
+        _power = level
+        _power_epoch += 1
+        pids = list(_active_pids)
+    for pid in pids:
+        _apply_power(pid, level)
+
+
+def _apply_power(pid: int, level: str) -> None:
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        n = psutil.cpu_count() or 1
+        k = n if level == "max" else max(2, round(n * _POWER_FRAC[level]))
+        if hasattr(p, "cpu_affinity"):  # macOS afinitu nepodporuje
+            # nejvyšší jádra (celá fyzická jádra i s SMT sourozenci); nízká
+            # jádra, kam Windows plánuje systém a UI, zůstanou volná
+            p.cpu_affinity(list(range(n - k, n)))
+        if IS_WIN:
+            p.nice({"low": psutil.IDLE_PRIORITY_CLASS,
+                    "balanced": psutil.BELOW_NORMAL_PRIORITY_CLASS,
+                    "max": psutil.NORMAL_PRIORITY_CLASS}[level])
+        else:  # zpět na 0 jde jen s právy správce — neúspěch nevadí
+            p.nice({"low": 19, "balanced": 10, "max": 0}[level])
+    except Exception:
+        pass
+
+
+class _PhaseEta:
+    """Odhad zbývajícího času fáze z rychlosti měřené od posledního „bodu
+    nula" — začátku fáze, nebo změny výkonu (po ní platí nová rychlost)."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.t0 = time.perf_counter()
+        self.f0 = 0.0
+        self.last = 0.0
+        self.epoch = _power_epoch
+
+    def remaining(self, f: float) -> Optional[float]:
+        if self.epoch != _power_epoch:  # výkon změněn → měřit znovu od teď
+            self.epoch = _power_epoch
+            self.t0, self.f0 = time.perf_counter(), self.last
+        if f < 0:
+            return None
+        self.last = f
+        df = f - self.f0
+        if df <= 0.02:
+            return None
+        return (time.perf_counter() - self.t0) / df * (1 - f)
+
+
+def _track(proc: subprocess.Popen) -> None:
+    with _power_lock:
+        _active_pids.add(proc.pid)
+        level = _power
+    _apply_power(proc.pid, level)
+
+
+def _untrack(proc: subprocess.Popen) -> None:
+    with _power_lock:
+        _active_pids.discard(proc.pid)
 
 
 def _rc_str(rc: int) -> str:
@@ -139,6 +233,7 @@ def _stream_proc(cmd: list[str], on_line: Callable[[str], bool],
         stderr=subprocess.PIPE if read_stderr else subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
         creationflags=_NO_WINDOW, env=env)
+    _track(proc)
     stream = proc.stderr if read_stderr else proc.stdout
     # Hlídací vlákno: čtení výstupu blokuje mezi řádky, proto cancel řešíme
     # nezávisle — pollujeme každých 0,2 s a proces rovnou zabijeme.
@@ -161,6 +256,10 @@ def _stream_proc(cmd: list[str], on_line: Callable[[str], bool],
                 del tail[:-20]
         proc.wait()
     finally:
+        if proc.poll() is None:  # výjimka uprostřed čtení → nenechat proces sirotkem
+            proc.kill()
+            proc.wait()
+        _untrack(proc)
         stop_watch.set()
         if watcher:
             watcher.join(timeout=1)
@@ -522,29 +621,24 @@ def process(src: str | Path, out_dir: str | Path, *, do_diarize: bool = True,
         # DIAR_RTF = hrubý odhad času diarizace (zlomek délky), než ji změříme.
         DIAR_RTF = 0.13
         w_span = 0.85 if do_diarize else 1.0
-        w_t0 = [0.0]
-        d_t0 = [0.0]  # definováno před closures — d_cb na něj sahá
+        w_eta = _PhaseEta()
+        d_eta = _PhaseEta()
 
         def t_cb(m, f):
             if not cb:
                 return
-            eta = None
-            if f > 0.02 and duration > 0:
-                el = time.perf_counter() - w_t0[0]
-                rtf = el / (f * duration)
-                eta = rtf * duration * (1 - f) + (DIAR_RTF * duration if do_diarize else 0)
+            eta = w_eta.remaining(f) if duration > 0 else None
+            if eta is not None and do_diarize:  # + hrubý odhad diarizace
+                eta += DIAR_RTF * duration / _POWER_FRAC[_power] ** 0.8
             cb(m, w_span * f if f >= 0 else f, eta)
 
         def d_cb(m, f):
             if not cb:
                 return
-            eta = None
-            if f > 0.02 and duration > 0:
-                el = time.perf_counter() - d_t0[0]
-                eta = max(0.0, el / f - el)  # zbytek diarizace
-            cb(m, 0.85 + 0.15 * f if f >= 0 else f, eta)
+            cb(m, 0.85 + 0.15 * f if f >= 0 else f,
+               d_eta.remaining(f) if duration > 0 else None)
 
-        w_t0[0] = time.perf_counter()
+        w_eta.reset()
         transcript = transcribe(wav, lang=lang, threads=threads, prompt=prompt,
                                 cb=(t_cb if cb else None), cancel=cancel)
 
@@ -558,7 +652,7 @@ def process(src: str | Path, out_dir: str | Path, *, do_diarize: bool = True,
 
         diar_error: Optional[str] = None
         if do_diarize:
-            d_t0[0] = time.perf_counter()
+            d_eta.reset()
             try:
                 diar = diarize_isolated(wav, threshold=threshold,
                                         num_speakers=num_speakers, threads=threads,

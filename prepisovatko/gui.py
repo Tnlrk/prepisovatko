@@ -103,7 +103,7 @@ except ImportError:
 
 import core
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 ICON_PATH = core.ROOT / "assets" / "icon.ico"  # core.ROOT funguje i v .app bundlu
 
 # Jazyk → (whisper kód, slovo pro mluvčího ve výstupu)
@@ -117,6 +117,12 @@ LANGS: dict[str, tuple[str, str]] = {
     "Auto-detekce": ("auto", "Speaker"),
 }
 SPEAKER_CHOICES = ["Automaticky"] + [str(i) for i in range(1, 11)]
+# Přepínač výkonu: popisek → (úroveň v core, vysvětlení pro uživatele)
+POWER_UI = {
+    "Na pozadí": ("low", "PC plně použitelné, přepis nejpomalejší"),
+    "Vyvážený": ("balanced", "polovina procesoru, na PC se dá pracovat"),
+    "Plný": ("max", "nejrychlejší, PC bude během přepisu pomalé"),
+}
 
 _AUDIO_EXT = "*.mp3 *.wav *.m4a *.flac *.ogg *.opus *.aac *.wma *.mka"
 _VIDEO_EXT = "*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.wmv *.flv *.ts *.mpg *.mpeg"
@@ -254,7 +260,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     @staticmethod
     def _section(parent, title: str, expand: bool = False) -> ctk.CTkFrame:
         frame = ctk.CTkFrame(parent)
-        frame.pack(fill="both" if expand else "x", expand=expand, padx=18, pady=(0, 12))
+        frame.pack(fill="both" if expand else "x", expand=expand, padx=18, pady=(0, 10))
         ctk.CTkLabel(frame, text=title, font=("", 11, "bold"),
                      text_color=("gray25", "gray75")).pack(anchor="w", padx=14, pady=(10, 0))
         return frame
@@ -263,7 +269,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _build(self) -> None:
         # ── Hlavička ──────────────────────────────────────────────
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.pack(fill="x", padx=18, pady=(14, 12))
+        top.pack(fill="x", padx=18, pady=(10, 8))
         head = ctk.CTkFrame(top, fg_color="transparent")
         head.pack(side="left")
         ctk.CTkLabel(head, text="Přepisovátko", font=("", 26, "bold")).pack(anchor="w")
@@ -294,7 +300,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                       command=self._clear_all).pack(side="left")
         self.count_lbl = ctk.CTkLabel(bar, text="", text_color=("gray25", "gray75"))
         self.count_lbl.pack(side="right")
-        self.list = ctk.CTkScrollableFrame(files, height=120, fg_color="transparent")
+        self.list = ctk.CTkScrollableFrame(files, height=90, fg_color="transparent")
         try:  # posuvník CTk má výchozí výšku 200 px a tím by frontu natahoval
             self.list._scrollbar.configure(height=0)
         except Exception:
@@ -376,6 +382,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                                       hover_color=("gray60", "gray40"),
                                       state="disabled", command=self._open_out)
         self.open_btn.pack(side="right")
+
+        # ── Výkon (lze měnit i během přepisu) ─────────────────────
+        pw = ctk.CTkFrame(self, fg_color="transparent")
+        pw.pack(fill="x", padx=18, pady=(8, 0))
+        ctk.CTkLabel(pw, text="Výkon přepisu:").pack(side="left")
+        self.power = ctk.CTkSegmentedButton(pw, values=list(POWER_UI),
+                                            command=self._power_changed)
+        self.power.pack(side="left", padx=(8, 10))
+        self.power_info = ctk.CTkLabel(pw, text="", font=("", 11), anchor="w",
+                                       text_color=("gray25", "gray75"))
+        self.power_info.pack(side="left", fill="x", expand=True)
+        level = _load_settings().get("power", "balanced")
+        ui = next((k for k, v in POWER_UI.items() if v[0] == level), "Vyvážený")
+        self.power.set(ui)
+        self._power_changed(ui, save=False)
 
         # ── Progress + stav + log ─────────────────────────────────
         self.progress = ctk.CTkProgressBar(self, height=14)
@@ -612,6 +633,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.vocab_cnt.configure(text=f"{n}/{core.PROMPT_MAX_CHARS}",
                                      text_color=("gray25", "gray75"))
 
+    def _power_changed(self, ui: str, save: bool = True) -> None:
+        """Přepnutí výkonu — platí okamžitě i pro právě běžící přepis."""
+        level, info = POWER_UI.get(ui, POWER_UI["Vyvážený"])
+        core.set_power(level)
+        self.power_info.configure(text=info)
+        if save:
+            _save_settings(power=level)
+            flog(f"POWER → {level}")
+            if self.cur:  # stará rychlost už neplatí; odhad se přepočítá
+                self.cur["eta"] = None
+
     def _on_close(self) -> None:
         _save_settings(vocabulary=self._vocab_text())
         self.destroy()
@@ -649,7 +681,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 size_mb = it.path.stat().st_size / 2**20
             except OSError:
                 size_mb = -1
-            flog(f"START {it.path} ({size_mb:.1f} MB) opts={opts}")
+            flog(f"START {it.path} ({size_mb:.1f} MB) opts={opts} power={core._power}")
             try:
                 def cb(msg: str, frac: float, eta=None, _id=it.id):
                     self.msgq.put(("progress", (_id, msg, frac, eta)))
@@ -831,11 +863,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             "PODPOROVANÉ VSTUPY\n"
             "Audio: mp3, wav, m4a, flac, ogg, opus, aac…\n"
             "Video: mp4, mkv, mov, avi, webm… (vytáhne se zvuková stopa)\n\n"
-            "DŮLEŽITÉ — VÝKON\n"
-            "Během přepisu je procesor vytížený naplno a počítač může být po tu dobu\n"
-            "pomalý a hůř použitelný pro jinou práci. U delších nahrávek to může trvat\n"
-            "i desítky minut (přepis zhruba 0,5–0,7× délky nahrávky, diarizace přidá\n"
-            "~0,1×). Tlačítkem Zastavit lze zpracování kdykoli okamžitě přerušit.\n\n"
+            "VÝKON PŘEPISU\n"
+            "Přepínačem „Výkon přepisu“ určíš, kolik procesoru přepis smí použít —\n"
+            "a to i během běžícího přepisu:\n"
+            "   • Na pozadí — počítač zůstane plně použitelný, přepis je nejpomalejší.\n"
+            "   • Vyvážený — polovina procesoru, na počítači se dá normálně pracovat.\n"
+            "   • Plný — nejrychlejší, ale počítač bude během přepisu pomalý.\n"
+            "Při plném výkonu trvá přepis zhruba 0,5–0,7× délky nahrávky, rozpoznání\n"
+            "mluvčích přidá ~0,1×; nižší výkon to úměrně prodlouží. Tlačítkem\n"
+            "Zastavit lze zpracování kdykoli okamžitě přerušit.\n\n"
             "PŘI POTÍŽÍCH\n"
             "Aplikace si vede záznam (log) — při hlášení chyby pošli správci soubor:\n"
             f"{LOG_FILE}\n\n"
