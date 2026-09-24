@@ -324,7 +324,11 @@ def transcribe(wav_path: str | Path, lang: str = "cs",
     threads = threads or _default_threads()
     with tempfile.TemporaryDirectory() as td:
         prefix = Path(td) / "out"
-        cmd = [str(WHISPER_EXE), "-m", str(WHISPER_MODEL), "-l", lang,
+        # POZOR na diakritiku v cestách (např. složka „Přepisovátko II"): whisper-cli
+        # dostává parametry v ANSI (cp1250), ale MODEL otevírá přes ggml_fopen jako
+        # UTF-8 → bez překódování spadne 0xC0000409. Zvuk (-f) a výstup (-of) naopak
+        # otevírá ANSI funkcemi → ty se předávají BEZ překódování (ověřeno testem).
+        cmd = [str(WHISPER_EXE), "-m", _argv_safe(str(WHISPER_MODEL)), "-l", lang,
                "-t", str(threads), "-pp", "-oj", "-of", str(prefix)]
         if prompt:  # slovník výrazů pro celou nahrávku, ne jen prvních 30 s
             cmd += ["--prompt", _argv_safe(prompt), "--carry-initial-prompt"]
@@ -345,7 +349,12 @@ def transcribe(wav_path: str | Path, lang: str = "cs",
         # whisper-cli píše průběh (-pp) i timings na stderr → streamujeme a parsujeme.
         rc, tail = _stream_proc(cmd, _on_line, cancel, read_stderr=True)
         if rc != 0:
-            raise RuntimeError(f"whisper selhal ({_rc_str(rc)}):\n" + "".join(tail))
+            hint = ""
+            if IS_WIN and (rc < 0 or rc > 0xFFFF):  # tvrdý pád, ne běžná chyba
+                hint = ("\nProgram pro přepis neočekávaně spadl. Zkus složku aplikace "
+                        "přesunout mimo OneDrive (např. do C:\\Prepisovatko). Pokud to "
+                        "nepomůže, pošli správci log (viz nápověda).\n")
+            raise RuntimeError(f"whisper selhal ({_rc_str(rc)}):{hint}\n" + "".join(tail))
         data = json.loads(Path(f"{prefix}.json").read_text(encoding="utf-8"))
 
     segs: list[Seg] = []
@@ -469,8 +478,18 @@ def diarize_isolated(wav_path: str | Path, threshold: float = DEFAULT_THRESHOLD,
 
 def _diar_worker(argv: list[str]) -> int:
     """Vstupní bod podprocesu: core.py --diar-worker <wav> <out.json> <thr> <n> <t>."""
+    global SEG_MODEL, EMB_MODEL
     wav, out_json, thr, nspk, thr_n = argv
     samples = read_wav16k_mono(wav)
+    # sherpa-onnx na Windows otevírá modely ANSI funkcemi (cp1250) → cesta
+    # s diakritikou (např. „Přepisovátko II") pro něj „neexistuje". Relativní
+    # ASCII cesta vůči pracovní složce to obejde; jde o samostatný proces,
+    # takže změna pracovní složky ani globálů GUI neovlivní.
+    if IS_WIN and not (str(SEG_MODEL) + str(EMB_MODEL)).isascii():
+        base = MODELS / "diarize"
+        os.chdir(base)
+        SEG_MODEL = Path(os.path.relpath(SEG_MODEL, base))
+        EMB_MODEL = Path(os.path.relpath(EMB_MODEL, base))
 
     def _cb(_m: str, f: float) -> None:
         if f >= 0:
@@ -584,15 +603,58 @@ def write_srt(segs: list[Seg], path: str | Path, with_speakers: bool,
 # --------------------------------------------------------------------------- #
 # Orchestrace
 # --------------------------------------------------------------------------- #
+def _is_cloud_placeholder(path: Path) -> bool:
+    """Soubor „jen v cloudu" (OneDrive Files On-Demand) — na disku není obsah.
+    whisper/sherpa ho pak nemusí načíst a spadnou bez srozumitelné hlášky."""
+    if not IS_WIN:
+        return False
+    try:
+        attrs = path.stat().st_file_attributes  # type: ignore[attr-defined]
+    except (OSError, AttributeError):
+        return False
+    FILE_ATTRIBUTE_OFFLINE = 0x1000
+    FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+    return bool(attrs & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                         | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
+
+
 def _check_runtime(do_diarize: bool) -> None:
-    """Srozumitelná chyba místo kryptického WinError, když chybí kus distribuce."""
-    missing = [p for p in ([WHISPER_EXE, WHISPER_MODEL]
-                           + ([SEG_MODEL, EMB_MODEL] if do_diarize else []))
-               if not Path(p).exists()]
+    """Srozumitelná chyba místo kryptického pádu, když je distribuce neúplná,
+    nerozbalila se celá, nebo soubory leží jen v cloudu (OneDrive)."""
+    # (soubor, minimální velikost, popis) — velikost odhalí nedokončené rozbalení
+    need = [(WHISPER_EXE, 100_000, "program pro přepis"),
+            (WHISPER_MODEL, 500 * 2**20, "model pro přepis")]
+    if do_diarize:
+        need += [(SEG_MODEL, 4 * 2**20, "model pro rozpoznání mluvčích"),
+                 (EMB_MODEL, 30 * 2**20, "hlasový model pro rozpoznání mluvčích")]
+    missing, broken, cloud = [], [], []
+    for path, min_size, what in need:
+        p = Path(path)
+        try:
+            size = p.stat().st_size
+        except OSError:
+            missing.append(f"{what}: {p}")
+            continue
+        if size < min_size:
+            broken.append(f"{what}: {p.name} má {size / 2**20:.0f} MB, "
+                          f"očekáváno aspoň {min_size / 2**20:.0f} MB")
+        elif _is_cloud_placeholder(p):
+            cloud.append(f"{what}: {p}")
     if missing:
-        names = "\n  ".join(str(m) for m in missing)
-        raise RuntimeError(f"Chybí součásti aplikace:\n  {names}\n"
-                           "Zkontroluj, že je distribuce kompletně rozbalená.")
+        raise RuntimeError("Chybí součásti aplikace:\n  " + "\n  ".join(missing)
+                           + "\nRozbal prosím celý stažený ZIP znovu.")
+    if broken:
+        raise RuntimeError("Některé soubory aplikace jsou neúplné — rozbalení ZIPu\n"
+                           "zřejmě neproběhlo celé:\n  " + "\n  ".join(broken)
+                           + "\nRozbal ZIP znovu (pravé tlačítko → Extrahovat vše)\n"
+                             "do složky mimo OneDrive, např. C:\\Prepisovatko.")
+    if cloud:
+        raise RuntimeError("Soubory aplikace nejsou stažené v počítači, leží jen\n"
+                           "v cloudu (OneDrive):\n  " + "\n  ".join(cloud)
+                           + "\nKlikni na složku aplikace pravým tlačítkem a zvol\n"
+                             "„Vždy zachovat na tomto zařízení“, nebo ji přesuň\n"
+                             "mimo OneDrive (Plocha a Dokumenty bývají v OneDrive).")
 
 
 def process(src: str | Path, out_dir: str | Path, *, do_diarize: bool = True,

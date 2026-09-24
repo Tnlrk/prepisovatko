@@ -1,4 +1,4 @@
-PŘEPISOVÁTKO v1.4.0
+PŘEPISOVÁTKO v1.4.1
 ====================
 Lokální (offline) přepis nahrávek z porad s detekcí mluvčích.
 Nic se neposílá na internet — vše běží na tomto počítači.

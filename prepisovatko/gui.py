@@ -103,7 +103,7 @@ except ImportError:
 
 import core
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 ICON_PATH = core.ROOT / "assets" / "icon.ico"  # core.ROOT funguje i v .app bundlu
 
 # Jazyk → (whisper kód, slovo pro mluvčího ve výstupu)
